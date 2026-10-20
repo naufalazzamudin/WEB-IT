@@ -229,5 +229,17 @@
       "updatedAt": "2026-10-12T13:10:00Z",
       "updatedBy": "ITTRAINEE"
     }
-  ]
+  ],
+  "googleIntegration": {
+    "spreadsheetUrl": "https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit?usp=sharing",
+    "spreadsheetId": "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms",
+    "driveFolderUrl": "https://drive.google.com/drive/folders/1a2b3c4d5e6f7g8h9i0j_KLMNOPQRSTUV?usp=sharing",
+    "driveFolderId": "1a2b3c4d5e6f7g8h9i0j_KLMNOPQRSTUV",
+    "connectedAccount": null,
+    "cachedAccessToken": null,
+    "lastSyncedAt": null,
+    "lastSyncStatus": "idle",
+    "lastSyncMessage": null,
+    "syncedInventoryCount": 0
+  }
 }

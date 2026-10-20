@@ -43,22 +43,8 @@ import {
   deletePurchaseOrder,
   downloadExcel,
   downloadPOExcel,
-  getStoredSecretToken,
-  fetchSheetConfig,
-  syncDataFromSheets,
-  SheetConfig
+  getStoredSecretToken
 } from './lib/api';
-import { getGoogleAccessToken, initGoogleAuth } from './lib/google-auth';
-import {
-  fetchInventoryFromSheets,
-  fetchPOFromSheets,
-  syncInventoryItemToSheets,
-  deleteInventoryItemFromSheets,
-  syncPOItemToSheets,
-  deletePOItemFromSheets,
-  getSpreadsheetDetails,
-  resolveSheetNames
-} from './lib/sheets-service';
 import { Loader2 } from 'lucide-react';
 
 const AppContent: React.FC = () => {
@@ -68,15 +54,6 @@ const AppContent: React.FC = () => {
   const [currentTab, setCurrentTab] = useState<NavTab>('dashboard');
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [showUserManagementFromLogin, setShowUserManagementFromLogin] = useState(false);
-
-  // Google Sheets integration state
-  const [sheetConfig, setSheetConfig] = useState<SheetConfig>({
-    isEnabled: false,
-    spreadsheetUrl: '',
-    spreadsheetId: '',
-    spreadsheetTitle: '',
-    lastSyncTime: null
-  });
 
   // Inventory Data
   const [inventoryItems, setInventoryItems] = useState<InventoryItem[]>([]);
@@ -190,47 +167,13 @@ const AppContent: React.FC = () => {
     }
   }, [poFilters, poCurrentPage]);
 
-  // Fetch sheet config and attempt initial auto-sync from Google Sheets
-  const initSheetIntegration = useCallback(async () => {
-    try {
-      const cfg = await fetchSheetConfig();
-      setSheetConfig(cfg);
-
-      if (cfg.isEnabled && cfg.spreadsheetId) {
-        const token = await getGoogleAccessToken();
-        if (token) {
-          try {
-            const details = await getSpreadsheetDetails(cfg.spreadsheetId, token);
-            const { invSheet, poSheet } = resolveSheetNames(details);
-            const [invFromSheets, poFromSheets] = await Promise.all([
-              fetchInventoryFromSheets(cfg.spreadsheetId, token, invSheet),
-              fetchPOFromSheets(cfg.spreadsheetId, token, poSheet)
-            ]);
-
-            if (invFromSheets.length > 0 || poFromSheets.length > 0) {
-              await syncDataFromSheets(invFromSheets, poFromSheets);
-              refreshDashboardData();
-              loadInventoryItems();
-              loadPOItems();
-            }
-          } catch (syncErr) {
-            console.warn('Initial sheet sync failed:', syncErr);
-          }
-        }
-      }
-    } catch (err) {
-      console.warn('Could not load sheet config:', err);
-    }
-  }, [refreshDashboardData, loadInventoryItems, loadPOItems]);
-
   useEffect(() => {
     if (isAuthenticated) {
       refreshDashboardData();
       loadInventoryItems();
       loadPOItems();
-      initSheetIntegration();
     }
-  }, [isAuthenticated, refreshDashboardData, loadInventoryItems, loadPOItems, initSheetIntegration]);
+  }, [isAuthenticated, refreshDashboardData, loadInventoryItems, loadPOItems]);
 
   // Navigation tab switching
   const handleSelectTab = (tab: NavTab) => {
@@ -275,50 +218,17 @@ const AppContent: React.FC = () => {
     setIsAddEditInvOpen(true);
   };
 
-  const handleInventorySuccess = async () => {
+  const handleInventorySuccess = () => {
     refreshDashboardData();
     loadInventoryItems();
-
-    // Real-time synchronization to Google Sheets DATABASE WEB IT
-    if (sheetConfig.isEnabled && sheetConfig.spreadsheetId) {
-      try {
-        const token = await getGoogleAccessToken();
-        if (token) {
-          const details = await getSpreadsheetDetails(sheetConfig.spreadsheetId, token);
-          const { invSheet } = resolveSheetNames(details);
-          const latest = await fetchInventory({}, 1, 1);
-          if (latest.data && latest.data[0]) {
-            await syncInventoryItemToSheets(sheetConfig.spreadsheetId, token, latest.data[0], invSheet);
-          }
-        }
-      } catch (e) {
-        console.warn('Realtime inventory sheet sync notice:', e);
-      }
-    }
   };
 
   const handleDeleteInventory = async () => {
     if (!invToDelete) return;
     setIsDeleting(true);
     try {
-      const deletedId = invToDelete.id;
-      await deleteInventory(deletedId);
+      await deleteInventory(invToDelete.id);
       addToast('Inventory item deleted successfully.', 'success');
-
-      // Real-time deletion from Google Sheets DATABASE WEB IT
-      if (sheetConfig.isEnabled && sheetConfig.spreadsheetId) {
-        try {
-          const token = await getGoogleAccessToken();
-          if (token) {
-            const details = await getSpreadsheetDetails(sheetConfig.spreadsheetId, token);
-            const { invSheet } = resolveSheetNames(details);
-            await deleteInventoryItemFromSheets(sheetConfig.spreadsheetId, token, deletedId, invSheet);
-          }
-        } catch (e) {
-          console.warn('Realtime inventory sheet delete notice:', e);
-        }
-      }
-
       setInvToDelete(null);
       refreshDashboardData();
       loadInventoryItems();
@@ -340,50 +250,17 @@ const AppContent: React.FC = () => {
     setIsAddEditPOOpen(true);
   };
 
-  const handlePOSuccess = async () => {
+  const handlePOSuccess = () => {
     refreshDashboardData();
     loadPOItems();
-
-    // Real-time synchronization to Google Sheets DATABASE WEB IT
-    if (sheetConfig.isEnabled && sheetConfig.spreadsheetId) {
-      try {
-        const token = await getGoogleAccessToken();
-        if (token) {
-          const details = await getSpreadsheetDetails(sheetConfig.spreadsheetId, token);
-          const { poSheet } = resolveSheetNames(details);
-          const latest = await fetchPurchaseOrders({}, 1, 1);
-          if (latest.data && latest.data[0]) {
-            await syncPOItemToSheets(sheetConfig.spreadsheetId, token, latest.data[0], poSheet);
-          }
-        }
-      } catch (e) {
-        console.warn('Realtime PO sheet sync notice:', e);
-      }
-    }
   };
 
   const handleDeletePO = async () => {
     if (!poToDelete) return;
     setIsDeleting(true);
     try {
-      const deletedId = poToDelete.id;
-      await deletePurchaseOrder(deletedId);
+      await deletePurchaseOrder(poToDelete.id);
       addToast('Purchase Order deleted successfully.', 'success');
-
-      // Real-time deletion from Google Sheets DATABASE WEB IT
-      if (sheetConfig.isEnabled && sheetConfig.spreadsheetId) {
-        try {
-          const token = await getGoogleAccessToken();
-          if (token) {
-            const details = await getSpreadsheetDetails(sheetConfig.spreadsheetId, token);
-            const { poSheet } = resolveSheetNames(details);
-            await deletePOItemFromSheets(sheetConfig.spreadsheetId, token, deletedId, poSheet);
-          }
-        } catch (e) {
-          console.warn('Realtime PO sheet delete notice:', e);
-        }
-      }
-
       setPoToDelete(null);
       refreshDashboardData();
       loadPOItems();
@@ -457,11 +334,6 @@ const AppContent: React.FC = () => {
         <Header
           onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)}
           onLogout={logout}
-          sheetStatus={{
-            isEnabled: sheetConfig.isEnabled && !!sheetConfig.spreadsheetId,
-            title: sheetConfig.spreadsheetTitle
-          }}
-          onOpenSettings={() => setCurrentTab('settings')}
         />
 
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto">
@@ -619,6 +491,7 @@ const AppContent: React.FC = () => {
           {currentTab === 'settings' && (
             <SettingsView
               onLogout={logout}
+              onToast={addToast}
               onOpenUserManagement={() => {
                 const hasSecretToken = getStoredSecretToken();
                 if (!hasSecretToken) {
@@ -627,13 +500,6 @@ const AppContent: React.FC = () => {
                   setCurrentTab('users');
                 }
               }}
-              onDataSynced={() => {
-                fetchSheetConfig().then(setSheetConfig);
-                refreshDashboardData();
-                loadInventoryItems();
-                loadPOItems();
-              }}
-              addToast={addToast}
             />
           )}
         </main>

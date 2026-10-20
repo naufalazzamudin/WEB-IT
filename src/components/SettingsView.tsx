@@ -2,730 +2,743 @@ import React, { useState, useEffect } from 'react';
 import {
   Settings,
   Shield,
-  User as UserIcon,
+  User,
   HardDrive,
   LogOut,
   Sun,
   Moon,
-  Database,
   ExternalLink,
   CheckCircle2,
   AlertCircle,
-  RefreshCw,
-  PlusCircle,
-  Link as LinkIcon,
   FileSpreadsheet,
-  Layers,
-  Sparkles
+  FolderGit2,
+  RefreshCw,
+  Lock,
+  Unlock,
+  Check,
+  Info,
+  HelpCircle
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import type { GoogleIntegrationSettings, InventoryItem } from '../lib/types';
 import {
-  googleSignIn,
-  googleSignOut,
-  initGoogleAuth,
-  getGoogleAccessToken,
-  getCachedGoogleUser
-} from '../lib/google-auth';
-import {
-  extractSpreadsheetId,
-  getSpreadsheetDetails,
-  createDatabaseWebItSpreadsheet,
-  pushAllToSheets,
-  fetchInventoryFromSheets,
-  fetchPOFromSheets,
-  resolveSheetNames,
-  REQUIRED_SPREADSHEET_NAME,
-  SpreadsheetDetails
-} from '../lib/sheets-service';
-import {
-  fetchSheetConfig,
-  saveSheetConfig,
-  fetchAllData,
-  syncDataFromSheets,
-  SheetConfig
+  fetchGoogleSettings,
+  saveGoogleSettings,
+  saveGoogleAccountConnection,
+  disconnectGoogleAccountApi,
+  recordGoogleSyncStatus,
+  syncUpdatedInventoryItemsToServer,
+  fetchInventory
 } from '../lib/api';
+import {
+  extractGoogleSpreadsheetId,
+  extractGoogleDriveFolderId,
+  validateGoogleConfig
+} from '../lib/google-logic';
+import {
+  signInWithGoogle,
+  signOutGoogle,
+  getGoogleAccessToken,
+  testSpreadsheetAccess,
+  testDriveFolderAccess,
+  syncAllInventoryToSheets
+} from '../lib/google-auth';
 
 interface SettingsViewProps {
   onLogout: () => void;
   onOpenUserManagement: () => void;
-  onDataSynced?: () => void;
-  addToast: (text: string, type?: 'success' | 'error' | 'info') => void;
+  onToast?: (text: string, type?: 'success' | 'error' | 'info') => void;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
   onLogout,
   onOpenUserManagement,
-  onDataSynced,
-  addToast
+  onToast
 }) => {
   const { user } = useAuth();
+  const isItManager = user?.role === 'IT MANAGER';
+
   const [theme, setTheme] = useState<'light' | 'system'>('light');
 
-  // Google Account state
-  const [googleUser, setGoogleUser] = useState<any>(null);
-  const [googleToken, setGoogleToken] = useState<string | null>(null);
-  const [isSigningInGoogle, setIsSigningInGoogle] = useState(false);
-
-  // Sheet configuration state
-  const [sheetConfig, setSheetConfig] = useState<SheetConfig>({
-    isEnabled: false,
+  // Google Integration State
+  const [googleSettings, setGoogleSettings] = useState<GoogleIntegrationSettings>({
     spreadsheetUrl: '',
     spreadsheetId: '',
-    spreadsheetTitle: '',
-    lastSyncTime: null
+    driveFolderUrl: '',
+    driveFolderId: '',
+    connectedAccount: null,
+    lastSyncedAt: null,
+    lastSyncStatus: 'idle',
+    lastSyncMessage: null,
+    syncedInventoryCount: 0
   });
-  const [inputUrl, setInputUrl] = useState('');
-  const [isLoadingConfig, setIsLoadingConfig] = useState(true);
-  const [isCheckingSheet, setIsCheckingSheet] = useState(false);
-  const [isCreatingSheet, setIsCreatingSheet] = useState(false);
-  const [isSyncing, setIsSyncing] = useState(false);
-  const [sheetDetails, setSheetDetails] = useState<SpreadsheetDetails | null>(null);
 
-  // Destructive Action Confirmation Modal state
-  const [confirmDialog, setConfirmDialog] = useState<{
-    isOpen: boolean;
-    title: string;
+  const [spreadsheetUrlInput, setSpreadsheetUrlInput] = useState('');
+  const [driveFolderUrlInput, setDriveFolderUrlInput] = useState('');
+
+  const [isLoadingSettings, setIsLoadingSettings] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isConnectingGoogle, setIsConnectingGoogle] = useState(false);
+  const [isTesting, setIsTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{
+    success: boolean;
+    spreadsheetTitle?: string;
+    folderName?: string;
     message: string;
-    actionLabel: string;
-    onConfirm: () => Promise<void>;
-  }>({
-    isOpen: false,
-    title: '',
-    message: '',
-    actionLabel: 'Konfirmasi',
-    onConfirm: async () => {}
-  });
+  } | null>(null);
 
-  // Load existing Google Auth & Sheet Config
-  useEffect(() => {
-    // 1. Google Auth listener
-    const unsubscribe = initGoogleAuth(
-      (user, token) => {
-        setGoogleUser(user);
-        setGoogleToken(token);
-      },
-      () => {
-        const u = getCachedGoogleUser();
-        setGoogleUser(u);
-      }
-    );
+  // Sync state
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncProgressMsg, setSyncProgressMsg] = useState('');
+  const [syncProgressPercent, setSyncProgressPercent] = useState(0);
+  const [showSyncConfirmModal, setShowSyncConfirmModal] = useState(false);
 
-    // Initial check
-    const existingUser = getCachedGoogleUser();
-    if (existingUser) {
-      setGoogleUser(existingUser);
+  // Load Google settings from server (persisted globally across all users)
+  const loadSettings = async () => {
+    setIsLoadingSettings(true);
+    try {
+      const data = await fetchGoogleSettings();
+      setGoogleSettings(data);
+      setSpreadsheetUrlInput(data.spreadsheetUrl || '');
+      setDriveFolderUrlInput(data.driveFolderUrl || '');
+    } catch (err: any) {
+      console.error('Error loading Google settings:', err);
+      if (onToast) onToast('Gagal memuat pengaturan Google dari server.', 'error');
+    } finally {
+      setIsLoadingSettings(false);
     }
-    getGoogleAccessToken().then(tok => {
-      if (tok) setGoogleToken(tok);
-    });
+  };
 
-    // 2. Fetch server sheet config
-    fetchSheetConfig()
-      .then(cfg => {
-        setSheetConfig(cfg);
-        if (cfg.spreadsheetUrl) {
-          setInputUrl(cfg.spreadsheetUrl);
-        }
-      })
-      .catch(err => {
-        console.error('Error loading sheet config:', err);
-      })
-      .finally(() => {
-        setIsLoadingConfig(false);
-      });
-
-    return () => {
-      if (typeof unsubscribe === 'function') {
-        unsubscribe();
-      }
-    };
+  useEffect(() => {
+    loadSettings();
   }, []);
 
-  // When google token is available and spreadsheetId exists, inspect spreadsheet details
-  useEffect(() => {
-    if (googleToken && sheetConfig.spreadsheetId) {
-      getSpreadsheetDetails(sheetConfig.spreadsheetId, googleToken)
-        .then(details => {
-          setSheetDetails(details);
-        })
-        .catch(err => {
-          console.warn('Could not inspect current spreadsheet:', err);
-        });
+  // Handle Google Login (IT MANAGER Only)
+  const handleGoogleSignIn = async () => {
+    if (!isItManager) {
+      if (onToast) onToast('Hanya IT MANAGER yang dapat menghubungkan akun Google.', 'error');
+      return;
     }
-  }, [googleToken, sheetConfig.spreadsheetId]);
 
-  // Google Sign In handler
-  const handleGoogleLogin = async () => {
-    setIsSigningInGoogle(true);
+    setIsConnectingGoogle(true);
     try {
-      const res = await googleSignIn();
-      if (res) {
-        setGoogleUser(res.user);
-        setGoogleToken(res.accessToken);
-        addToast(`Berhasil menghubungkan akun Google: ${res.user.email}`, 'success');
+      const { user: gUser, accessToken } = await signInWithGoogle();
+      const accountInfo = {
+        email: gUser.email || '',
+        name: gUser.displayName || gUser.email || 'Google User',
+        photoUrl: gUser.photoURL || undefined,
+        connectedAt: new Date().toISOString(),
+        connectedBy: user?.username || 'ITMANAGER'
+      };
 
-        // If there is already an input URL or config ID, verify it immediately
-        const idToCheck = sheetConfig.spreadsheetId || extractSpreadsheetId(inputUrl);
-        if (idToCheck) {
-          try {
-            const details = await getSpreadsheetDetails(idToCheck, res.accessToken);
-            setSheetDetails(details);
-          } catch {
-            // Ignore initial inspection error
-          }
+      const res = await saveGoogleAccountConnection({
+        account: accountInfo,
+        accessToken
+      });
+
+      setGoogleSettings(res.data);
+      if (onToast) onToast(`Akun Google (${accountInfo.email}) berhasil dihubungkan oleh IT MANAGER!`, 'success');
+    } catch (err: any) {
+      console.error('Google sign in error:', err);
+      if (onToast) onToast(err.message || 'Gagal masuk dengan akun Google.', 'error');
+    } finally {
+      setIsConnectingGoogle(false);
+    }
+  };
+
+  // Handle Google Sign Out (IT MANAGER Only)
+  const handleGoogleDisconnect = async () => {
+    if (!isItManager) {
+      if (onToast) onToast('Hanya IT MANAGER yang dapat memutuskan akun Google.', 'error');
+      return;
+    }
+
+    const confirm = window.confirm('Apakah Anda yakin ingin memutuskan hubungan akun Google dari sistem?');
+    if (!confirm) return;
+
+    try {
+      await signOutGoogle();
+      const res = await disconnectGoogleAccountApi();
+      setGoogleSettings(res.data);
+      setTestResult(null);
+      if (onToast) onToast('Koneksi akun Google berhasil diputuskan.', 'info');
+    } catch (err: any) {
+      if (onToast) onToast(err.message || 'Gagal memutuskan akun Google.', 'error');
+    }
+  };
+
+  // Save URLs (IT MANAGER Only)
+  const handleSaveGoogleUrls = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!isItManager) {
+      if (onToast) onToast('Hanya IT MANAGER yang berhak mengubah URL Google Spreadsheet & Drive.', 'error');
+      return;
+    }
+
+    const validation = validateGoogleConfig(spreadsheetUrlInput, driveFolderUrlInput);
+    if (!validation.valid) {
+      const firstError = validation.errors.spreadsheetUrl || validation.errors.driveFolderUrl;
+      if (onToast) onToast(firstError || 'URL tidak valid.', 'error');
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      const res = await saveGoogleSettings({
+        spreadsheetUrl: spreadsheetUrlInput.trim(),
+        driveFolderUrl: driveFolderUrlInput.trim()
+      });
+      setGoogleSettings(res.data);
+      setTestResult(null);
+      if (onToast) onToast('URL Google Spreadsheet & Google Drive berhasil disimpan secara permanen!', 'success');
+    } catch (err: any) {
+      if (onToast) onToast(err.message || 'Gagal menyimpan URL Google.', 'error');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // Test Connection
+  const handleTestConnection = async () => {
+    const spreadsheetId = extractGoogleSpreadsheetId(spreadsheetUrlInput);
+    const driveFolderId = extractGoogleDriveFolderId(driveFolderUrlInput);
+
+    if (!spreadsheetId || !driveFolderId) {
+      if (onToast) onToast('Harap isi URL Google Spreadsheet dan URL Folder Drive yang valid terlebih dahulu.', 'error');
+      return;
+    }
+
+    let token = getGoogleAccessToken();
+    if (!token) {
+      if (isItManager) {
+        try {
+          const authRes = await signInWithGoogle();
+          token = authRes.accessToken;
+        } catch {
+          if (onToast) onToast('Harap hubungkan akun Google terlebih dahulu untuk menguji akses.', 'error');
+          return;
         }
+      } else {
+        if (onToast) onToast('Token Google belum aktif. Minta IT MANAGER untuk login akun Google.', 'error');
+        return;
       }
+    }
+
+    setIsTesting(true);
+    setTestResult(null);
+
+    try {
+      const [sheetTest, driveTest] = await Promise.all([
+        testSpreadsheetAccess(token, spreadsheetId),
+        testDriveFolderAccess(token, driveFolderId)
+      ]);
+
+      setTestResult({
+        success: true,
+        spreadsheetTitle: sheetTest.title,
+        folderName: driveTest.folderName,
+        message: `Koneksi Berhasil! Terhubung ke Spreadsheet "${sheetTest.title}" dan Folder Drive "${driveTest.folderName}".`
+      });
+
+      if (onToast) onToast('Koneksi Google Spreadsheet & Drive berhasil diverifikasi!', 'success');
     } catch (err: any) {
-      console.error('Google Sign In error:', err);
-      addToast(err.message || 'Gagal menghubungkan Akun Google', 'error');
+      setTestResult({
+        success: false,
+        message: err.message || 'Gagal menguji koneksi Google Spreadsheet atau Google Drive.'
+      });
+      if (onToast) onToast(err.message || 'Uji koneksi gagal.', 'error');
     } finally {
-      setIsSigningInGoogle(false);
+      setIsTesting(false);
     }
   };
 
-  const handleGoogleSignOut = async () => {
-    try {
-      await googleSignOut();
-      setGoogleUser(null);
-      setGoogleToken(null);
-      setSheetDetails(null);
-      addToast('Akun Google diputuskan', 'info');
-    } catch (err: any) {
-      addToast(err.message || 'Gagal memutus akun Google', 'error');
-    }
-  };
+  // Execute Synchronization
+  const handleExecuteSync = async () => {
+    setShowSyncConfirmModal(false);
 
-  // Verify and Save Google Spreadsheet
-  const handleVerifyAndSaveSheet = async () => {
-    if (!inputUrl.trim()) {
-      addToast('Silakan masukkan link Google Spreadsheet terlebih dahulu', 'error');
+    const spreadsheetId = googleSettings.spreadsheetId || extractGoogleSpreadsheetId(spreadsheetUrlInput);
+    const driveFolderId = googleSettings.driveFolderId || extractGoogleDriveFolderId(driveFolderUrlInput);
+
+    if (!spreadsheetId || !driveFolderId) {
+      if (onToast) onToast('URL Google Spreadsheet dan Folder Drive belum dikonfigurasi.', 'error');
       return;
     }
 
-    const spreadsheetId = extractSpreadsheetId(inputUrl.trim());
-    if (!spreadsheetId) {
-      addToast('Format link Spreadsheet tidak valid. Contoh: https://docs.google.com/spreadsheets/d/.../edit', 'error');
-      return;
-    }
-
-    if (!googleToken) {
-      addToast('Silakan hubungkan akun Google terlebih dahulu untuk memverifikasi spreadsheet', 'error');
-      return;
-    }
-
-    setIsCheckingSheet(true);
-    try {
-      const details = await getSpreadsheetDetails(spreadsheetId, googleToken);
-      setSheetDetails(details);
-
-      if (!details.isNamedCorrectly) {
-        addToast(
-          `Peringatan: Nama spreadsheet saat ini "${details.title}". Disarankan mengubah nama file menjadi "${REQUIRED_SPREADSHEET_NAME}".`,
-          'info'
-        );
+    let token = getGoogleAccessToken();
+    if (!token) {
+      if (isItManager) {
+        try {
+          const authRes = await signInWithGoogle();
+          token = authRes.accessToken;
+        } catch {
+          if (onToast) onToast('Koneksi Google memerlukan login akun oleh IT MANAGER.', 'error');
+          return;
+        }
+      } else {
+        if (onToast) onToast('Koneksi Google belum aktif. Minta IT MANAGER untuk menghubungkan akun Google.', 'error');
+        return;
       }
-
-      // Save to server
-      const updated = await saveSheetConfig({
-        spreadsheetUrl: inputUrl.trim(),
-        spreadsheetId,
-        spreadsheetTitle: details.title,
-        isEnabled: true
-      });
-      setSheetConfig(updated);
-      addToast(`Spreadsheet "${details.title}" berhasil dihubungkan sebagai database online!`, 'success');
-    } catch (err: any) {
-      console.error('Verify spreadsheet error:', err);
-      addToast(
-        `Gagal memeriksa spreadsheet: ${err.message}. Pastikan spreadsheet dibagikan dengan akses "Izinkan edit semua yang memiliki link".`,
-        'error'
-      );
-    } finally {
-      setIsCheckingSheet(false);
-    }
-  };
-
-  // Create "DATABASE WEB IT" automatically
-  const handleAutoCreateSpreadsheet = async () => {
-    if (!googleToken) {
-      addToast('Silakan hubungkan akun Google terlebih dahulu', 'error');
-      return;
-    }
-
-    setIsCreatingSheet(true);
-    try {
-      addToast('Sedang membuat Google Spreadsheet "DATABASE WEB IT" di Google Drive Anda...', 'info');
-      const details = await createDatabaseWebItSpreadsheet(googleToken);
-      setSheetDetails(details);
-      setInputUrl(details.url);
-
-      const updated = await saveSheetConfig({
-        spreadsheetUrl: details.url,
-        spreadsheetId: details.spreadsheetId,
-        spreadsheetTitle: details.title,
-        isEnabled: true
-      });
-      setSheetConfig(updated);
-
-      addToast(
-        'Spreadsheet "DATABASE WEB IT" berhasil dibuat otomatis dengan Sheet1 (Inventory) dan Sheet2 (Purchase Order)!',
-        'success'
-      );
-    } catch (err: any) {
-      console.error('Error creating spreadsheet:', err);
-      addToast(`Gagal membuat spreadsheet otomatis: ${err.message}`, 'error');
-    } finally {
-      setIsCreatingSheet(false);
-    }
-  };
-
-  // Pull data from Google Sheets into Web App
-  const handlePullFromSheets = async () => {
-    const spreadsheetId = sheetConfig.spreadsheetId || extractSpreadsheetId(inputUrl);
-    if (!spreadsheetId) {
-      addToast('Spreadsheet belum dihubungkan', 'error');
-      return;
-    }
-    if (!googleToken) {
-      addToast('Silakan login ke Akun Google Anda terlebih dahulu', 'error');
-      return;
     }
 
     setIsSyncing(true);
+    setSyncProgressMsg('Memuat seluruh data inventaris...');
+    setSyncProgressPercent(10);
+
     try {
-      addToast('Mengambil data terbaru dari Google Spreadsheet...', 'info');
-      const details = await getSpreadsheetDetails(spreadsheetId, googleToken);
-      setSheetDetails(details);
-      const { invSheet, poSheet } = resolveSheetNames(details);
+      // 1. Fetch all inventory items
+      const allItemsRes = await fetchInventory({}, 1, 1000);
+      const items = allItemsRes.data;
 
-      const [invItems, poItems] = await Promise.all([
-        fetchInventoryFromSheets(spreadsheetId, googleToken, invSheet),
-        fetchPOFromSheets(spreadsheetId, googleToken, poSheet)
-      ]);
+      setSyncProgressMsg(`Memulai sinkronisasi ${items.length} item inventaris...`);
+      setSyncProgressPercent(25);
 
-      const syncResult = await syncDataFromSheets(invItems, poItems);
-      setSheetConfig(prev => ({ ...prev, lastSyncTime: syncResult.lastSyncTime }));
-
-      addToast(
-        `Sinkronisasi berhasil! Memuat ${syncResult.inventoryCount} Inventory & ${syncResult.poCount} Purchase Order dari Google Spreadsheet.`,
-        'success'
-      );
-
-      if (onDataSynced) {
-        onDataSynced();
-      }
-    } catch (err: any) {
-      console.error('Pull from sheets error:', err);
-      addToast(`Gagal menarik data dari Google Sheets: ${err.message}`, 'error');
-    } finally {
-      setIsSyncing(false);
-    }
-  };
-
-  // Push local web app data to Google Sheets with mandatory confirmation dialog
-  const handlePushToSheets = () => {
-    const spreadsheetId = sheetConfig.spreadsheetId || extractSpreadsheetId(inputUrl);
-    if (!spreadsheetId) {
-      addToast('Spreadsheet belum dihubungkan', 'error');
-      return;
-    }
-    if (!googleToken) {
-      addToast('Silakan login ke Akun Google Anda terlebih dahulu', 'error');
-      return;
-    }
-
-    setConfirmDialog({
-      isOpen: true,
-      title: 'Perbarui Data di Google Spreadsheet?',
-      message:
-        'Tindakan ini akan menyinkronkan dan memperbarui seluruh baris data Inventory dan Purchase Order pada file Google Spreadsheet "DATABASE WEB IT". Apakah Anda yakin ingin melanjutkan?',
-      actionLabel: 'Ya, Perbarui Spreadsheet',
-      onConfirm: async () => {
-        setIsSyncing(true);
-        try {
-          addToast('Menyiapkan dan mengirim data ke Google Sheets...', 'info');
-          const all = await fetchAllData();
-          const details = await getSpreadsheetDetails(spreadsheetId, googleToken);
-          setSheetDetails(details);
-          const { invSheet, poSheet, invSheetId, poSheetId } = resolveSheetNames(details);
-
-          await pushAllToSheets(
-            spreadsheetId,
-            googleToken,
-            all.inventory,
-            all.purchaseOrders,
-            invSheet,
-            poSheet,
-            invSheetId,
-            poSheetId
-          );
-
-          const now = new Date().toISOString();
-          await saveSheetConfig({ lastSyncTime: now });
-          setSheetConfig(prev => ({ ...prev, lastSyncTime: now }));
-
-          addToast(
-            `Data berhasil diperbarui ke Google Sheets (${all.inventory.length} Inventory & ${all.purchaseOrders.length} PO)!`,
-            'success'
-          );
-        } catch (err: any) {
-          console.error('Push to sheets error:', err);
-          addToast(`Gagal mengirim data ke Google Sheets: ${err.message}`, 'error');
-        } finally {
-          setIsSyncing(false);
+      // 2. Perform sync (Drive photo uploads + Spreadsheet formatting & values)
+      const syncResult = await syncAllInventoryToSheets(
+        token,
+        spreadsheetId,
+        driveFolderId,
+        items,
+        (msg, cur, tot) => {
+          setSyncProgressMsg(msg);
+          const pct = Math.min(25 + Math.round((cur / (tot || 1)) * 65), 95);
+          setSyncProgressPercent(pct);
         }
-      }
-    });
-  };
-
-  // Toggle Sheets Mode
-  const handleToggleSheetsMode = async () => {
-    const newStatus = !sheetConfig.isEnabled;
-    try {
-      const updated = await saveSheetConfig({
-        ...sheetConfig,
-        isEnabled: newStatus
-      });
-      setSheetConfig(updated);
-      addToast(
-        newStatus
-          ? 'Mode Database Google Sheets telah DIAKTIFKAN'
-          : 'Mode Database Google Sheets DINONAKTIFKAN (menggunakan database lokal)',
-        'info'
       );
+
+      // 3. Update any new Google Drive photo URLs on our backend DB
+      await syncUpdatedInventoryItemsToServer(syncResult.updatedItems);
+
+      // 4. Record sync status on server
+      await recordGoogleSyncStatus({
+        status: 'success',
+        message: `Sinkronisasi berhasil: ${syncResult.count} barang diperbarui di Google Spreadsheet dan foto disimpan di Drive.`,
+        syncedCount: syncResult.count
+      });
+
+      setSyncProgressPercent(100);
+      setSyncProgressMsg('Sinkronisasi selesai 100%!');
+
+      // Reload settings to update UI
+      await loadSettings();
+
+      if (onToast) onToast(`Berhasil menyinkronkan ${syncResult.count} data barang ke Google Spreadsheet!`, 'success');
     } catch (err: any) {
-      addToast(err.message || 'Gagal mengubah mode database', 'error');
+      console.error('Sync error:', err);
+      await recordGoogleSyncStatus({
+        status: 'failed',
+        message: err.message || 'Gagal menyinkronkan ke Google Spreadsheet.'
+      });
+      await loadSettings();
+      if (onToast) onToast(err.message || 'Sinkronisasi gagal.', 'error');
+    } finally {
+      setTimeout(() => {
+        setIsSyncing(false);
+        setSyncProgressMsg('');
+        setSyncProgressPercent(0);
+      }, 1500);
     }
   };
+
+  const detectedSpreadsheetId = extractGoogleSpreadsheetId(spreadsheetUrlInput);
+  const detectedDriveFolderId = extractGoogleDriveFolderId(driveFolderUrlInput);
 
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
-      {/* Header */}
+    <div className="max-w-4xl mx-auto space-y-6 pb-12">
+      {/* Title */}
       <div>
         <div className="flex items-center gap-2 text-indigo-600 font-bold text-xs uppercase tracking-wider mb-1">
           <Settings className="w-4 h-4" />
-          <span>Pengaturan Sistem & Database</span>
+          <span>Application Preferences</span>
         </div>
         <h1 className="text-xl sm:text-2xl font-black text-slate-900 tracking-tight">
-          SYSTEM & DATABASE SETTINGS
+          SYSTEM SETTINGS & CLOUD DATABASE
         </h1>
         <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
-          Kelola koneksi online Google Spreadsheet, data staff, dan konfigurasi aplikasi
+          Kelola preferensi sistem, akun staf, dan integrasi Google Spreadsheet & Google Drive
         </p>
       </div>
 
-      {/* Online Database Google Spreadsheet Section */}
-      <div className="bg-gradient-to-br from-emerald-50/60 via-white to-teal-50/40 rounded-3xl border-2 border-emerald-200/80 p-6 sm:p-8 shadow-xs space-y-6">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-5 border-b border-emerald-100">
-          <div className="flex items-center gap-3">
-            <div className="w-12 h-12 rounded-2xl bg-emerald-600 text-white flex items-center justify-center shadow-md shadow-emerald-600/20">
-              <Database className="w-6 h-6" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h2 className="text-base sm:text-lg font-black text-slate-900 tracking-tight">
-                  DATABASE ONLINE GOOGLE SPREADSHEET
-                </h2>
-                <span
-                  className={`px-2.5 py-0.5 text-[11px] font-bold rounded-full ${
-                    sheetConfig.isEnabled && sheetConfig.spreadsheetId
-                      ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
-                      : 'bg-slate-100 text-slate-600 border border-slate-200'
-                  }`}
-                >
-                  {sheetConfig.isEnabled && sheetConfig.spreadsheetId ? '● REALTIME AKTIF' : 'NON-AKTIF'}
-                </span>
+      {/* Main Settings Card */}
+      <div className="bg-white rounded-3xl border border-slate-200 p-6 sm:p-8 shadow-2xs space-y-8">
+        {/* ========================================================= */}
+        {/* SECTION: GOOGLE SPREADSHEET & DRIVE CLOUD DATABASE       */}
+        {/* ========================================================= */}
+        <div className="bg-gradient-to-br from-slate-900 to-indigo-950 text-white rounded-3xl p-6 sm:p-7 shadow-md border border-slate-800">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-6 border-b border-white/10">
+            <div className="flex items-start sm:items-center gap-3">
+              <div className="w-12 h-12 rounded-2xl bg-white/10 backdrop-blur-md flex items-center justify-center text-white border border-white/10 shrink-0">
+                <FileSpreadsheet className="w-6 h-6 text-emerald-400" />
               </div>
-              <p className="text-xs text-slate-600 mt-0.5">
-                Hubungkan ke spreadsheet <strong>DATABASE WEB IT</strong> untuk sinkronisasi Inventory & Purchase Order secara realtime
-              </p>
+              <div>
+                <div className="flex items-center gap-2">
+                  <h2 className="text-lg font-black tracking-tight text-white">
+                    Google Spreadsheet & Google Drive Database
+                  </h2>
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                    Live Cloud Sync
+                  </span>
+                </div>
+                <p className="text-xs text-slate-300 mt-0.5">
+                  Sinkronisasi database barang ke Google Spreadsheet dan penyimpanan foto barang ke Google Drive
+                </p>
+              </div>
+            </div>
+
+            {/* Role indicator badge */}
+            <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-white/5 border border-white/10 text-xs font-semibold self-start sm:self-auto">
+              {isItManager ? (
+                <>
+                  <Unlock className="w-4 h-4 text-emerald-400" />
+                  <span className="text-emerald-300 font-bold">Akses IT MANAGER (Penuh)</span>
+                </>
+              ) : (
+                <>
+                  <Lock className="w-4 h-4 text-amber-400" />
+                  <span className="text-amber-300 font-bold">Kunci IT MANAGER (Hanya Baca)</span>
+                </>
+              )}
             </div>
           </div>
 
-          {sheetConfig.spreadsheetId && (
-            <button
-              type="button"
-              onClick={handleToggleSheetsMode}
-              className={`px-4 py-2 text-xs font-bold rounded-xl transition-all shadow-2xs ${
-                sheetConfig.isEnabled
-                  ? 'bg-emerald-600 hover:bg-emerald-700 text-white'
-                  : 'bg-slate-200 hover:bg-slate-300 text-slate-700'
-              }`}
-            >
-              {sheetConfig.isEnabled ? 'Nonaktifkan Mode Sheets' : 'Aktifkan Mode Sheets'}
-            </button>
-          )}
-        </div>
+          {/* Info Banner for Access Permission */}
+          <div className="mt-4 p-3.5 rounded-2xl bg-white/5 border border-white/10 flex items-start gap-3">
+            <Info className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
+            <div className="text-xs text-slate-300 leading-relaxed">
+              <strong className="text-white">Ketentuan Pengisian: </strong>
+              Hanya <span className="text-amber-300 font-bold">IT MANAGER</span> yang boleh mengisi login Google dan kolom URL. Pengaturan dan login Google yang diisi IT MANAGER tersimpan permanen di server dan tetap berlaku bagi seluruh pengguna (IT ASSIST & IT TRAINEE) tanpa ter-reset saat berganti akun.
+            </div>
+          </div>
 
-        {/* 1. Hubungkan Akun Google */}
-        <div className="bg-white/80 rounded-2xl p-5 border border-slate-200/80 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div>
-              <div className="text-xs font-bold text-slate-400 uppercase tracking-wider">Langkah 1</div>
-              <div className="text-sm font-bold text-slate-900">Hubungkan Akun Google</div>
-              <div className="text-xs text-slate-500 mt-0.5">
-                Masuk dengan akun Google yang memiliki akses edit pada spreadsheet target.
-              </div>
+          {/* Google Account Connection Status */}
+          <div className="mt-6 pt-6 border-t border-white/10 space-y-4">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                1. Status Login Akun Google
+              </span>
+              {googleSettings.connectedAccount && (
+                <span className="flex items-center gap-1.5 text-xs font-semibold text-emerald-400">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  Terhubung
+                </span>
+              )}
             </div>
 
-            {googleUser ? (
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-2.5 px-3 py-1.5 bg-emerald-50 border border-emerald-200 rounded-xl">
-                  {googleUser.photoURL ? (
+            {googleSettings.connectedAccount ? (
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-2xl bg-white/10 border border-white/10">
+                <div className="flex items-center gap-3">
+                  {googleSettings.connectedAccount.photoUrl ? (
                     <img
-                      src={googleUser.photoURL}
-                      alt={googleUser.displayName || 'Google User'}
-                      className="w-7 h-7 rounded-full border border-emerald-300"
+                      src={googleSettings.connectedAccount.photoUrl}
+                      alt="Google Avatar"
+                      className="w-10 h-10 rounded-full border border-white/20"
                     />
                   ) : (
-                    <div className="w-7 h-7 rounded-full bg-emerald-600 text-white flex items-center justify-center text-xs font-bold">
-                      {googleUser.email ? googleUser.email.charAt(0).toUpperCase() : 'G'}
+                    <div className="w-10 h-10 rounded-full bg-indigo-600 flex items-center justify-center font-bold text-white">
+                      {googleSettings.connectedAccount.name.charAt(0).toUpperCase()}
                     </div>
                   )}
-                  <div className="text-left">
-                    <div className="text-xs font-bold text-emerald-900 leading-tight">
-                      {googleUser.displayName || 'Google Account'}
+                  <div>
+                    <div className="text-sm font-bold text-white flex items-center gap-2">
+                      <span>{googleSettings.connectedAccount.name}</span>
+                      <span className="text-[11px] font-normal text-slate-300">
+                        ({googleSettings.connectedAccount.email})
+                      </span>
                     </div>
-                    <div className="text-[11px] text-emerald-700 font-mono truncate max-w-[180px]">
-                      {googleUser.email}
+                    <div className="text-[11px] text-slate-400 flex items-center gap-2 mt-0.5">
+                      <span>Dihubungkan oleh: <strong className="text-white">{googleSettings.connectedAccount.connectedBy}</strong></span>
+                      <span>•</span>
+                      <span>Izin: Google Sheets & Google Drive File</span>
                     </div>
                   </div>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={handleGoogleSignOut}
-                  className="px-3 py-1.5 text-xs font-semibold text-rose-600 hover:bg-rose-50 border border-rose-200 rounded-xl transition-colors"
-                >
-                  Ganti / Putuskan
-                </button>
+                {isItManager ? (
+                  <button
+                    type="button"
+                    onClick={handleGoogleDisconnect}
+                    className="px-3.5 py-1.5 rounded-xl bg-white/10 hover:bg-rose-500/20 text-xs font-semibold text-rose-300 border border-rose-500/30 transition-colors"
+                  >
+                    Putuskan Akun
+                  </button>
+                ) : (
+                  <div className="flex items-center gap-1.5 text-xs text-slate-400">
+                    <Lock className="w-3.5 h-3.5" />
+                    <span>Dikelola oleh IT MANAGER</span>
+                  </div>
+                )}
               </div>
             ) : (
-              /* Official Google Sign-In button per guidelines */
-              <button
-                type="button"
-                onClick={handleGoogleLogin}
-                disabled={isSigningInGoogle}
-                className="inline-flex items-center gap-3 px-4 py-2.5 bg-white hover:bg-slate-50 border border-slate-300 hover:border-slate-400 text-slate-700 font-semibold text-xs rounded-xl shadow-2xs transition-all active:scale-[0.98] disabled:opacity-50"
-              >
-                <svg className="w-4 h-4" viewBox="0 0 48 48">
-                  <path
-                    fill="#EA4335"
-                    d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
-                  />
-                  <path
-                    fill="#4285F4"
-                    d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
-                  />
-                  <path
-                    fill="#FBBC05"
-                    d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
-                  />
-                  <path
-                    fill="#34A853"
-                    d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
-                  />
-                </svg>
-                <span>{isSigningInGoogle ? 'Menghubungkan...' : 'Sign in with Google'}</span>
-              </button>
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-4 rounded-2xl bg-white/5 border border-white/10">
+                <div className="text-xs text-slate-300">
+                  <div className="font-semibold text-white">Akun Google Belum Dihubungkan</div>
+                  <div className="text-slate-400 mt-0.5">
+                    Hubungkan akun Google untuk memberikan izin baca & tulis ke Google Spreadsheet dan Google Drive.
+                  </div>
+                </div>
+
+                {isItManager ? (
+                  <button
+                    type="button"
+                    onClick={handleGoogleSignIn}
+                    disabled={isConnectingGoogle}
+                    className="inline-flex items-center gap-2.5 px-4 py-2 bg-white text-slate-900 rounded-xl font-bold text-xs hover:bg-slate-100 transition-all shadow-sm shrink-0 disabled:opacity-50"
+                  >
+                    {isConnectingGoogle ? (
+                      <RefreshCw className="w-4 h-4 animate-spin text-indigo-600" />
+                    ) : (
+                      <svg className="w-4 h-4" viewBox="0 0 48 48">
+                        <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+                        <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+                        <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+                        <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+                      </svg>
+                    )}
+                    <span>Hubungkan Akun Google</span>
+                  </button>
+                ) : (
+                  <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-500/10 text-amber-300 border border-amber-500/20 text-xs font-semibold">
+                    <Lock className="w-3.5 h-3.5" />
+                    <span>Menunggu IT MANAGER untuk login</span>
+                  </div>
+                )}
+              </div>
             )}
           </div>
-        </div>
 
-        {/* 2. Link Spreadsheet & Verifikasi */}
-        <div className="bg-white/80 rounded-2xl p-5 border border-slate-200/80 space-y-4">
-          <div>
-            <div className="text-xs font-bold text-slate-400 uppercase tracking-wider">Langkah 2</div>
-            <div className="text-sm font-bold text-slate-900">Kolom Link Google Spreadsheet</div>
-            <div className="text-xs text-slate-500 mt-0.5">
-              Masukkan link Google Sheets yang akan digunakan sebagai database aplikasi.
+          {/* Form for URLs */}
+          <form onSubmit={handleSaveGoogleUrls} className="mt-6 pt-6 border-t border-white/10 space-y-5">
+            <div className="text-xs font-bold uppercase tracking-wider text-slate-300">
+              2. Konfigurasi Link Google Spreadsheet & Google Drive
             </div>
-          </div>
 
-          <div className="space-y-3">
-            <div className="flex flex-col sm:flex-row gap-2">
-              <div className="relative flex-1">
-                <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
-                  <LinkIcon className="w-4 h-4" />
-                </div>
+            {/* Field 1: Spreadsheet URL */}
+            <div className="space-y-1.5">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                <label className="text-xs font-bold text-white flex items-center gap-1.5">
+                  <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>URL Google Spreadsheet Database</span>
+                  {!isItManager && <Lock className="w-3 h-3 text-amber-400 inline" />}
+                </label>
+                <span className="text-[11px] text-amber-300 font-medium">
+                  *Link spreadsheet harus izinkan edit untuk semua yang memiliki link
+                </span>
+              </div>
+              <div className="relative">
                 <input
-                  type="text"
-                  value={inputUrl}
-                  onChange={e => setInputUrl(e.target.value)}
-                  placeholder="https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5.../edit"
-                  className="w-full pl-10 pr-4 py-2.5 text-xs sm:text-sm bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all font-mono"
+                  type="url"
+                  value={spreadsheetUrlInput}
+                  onChange={(e) => setSpreadsheetUrlInput(e.target.value)}
+                  disabled={!isItManager || isSaving}
+                  placeholder="https://docs.google.com/spreadsheets/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit?usp=sharing"
+                  className={`w-full px-3.5 py-2.5 rounded-xl text-xs font-mono transition-colors border ${
+                    !isItManager
+                      ? 'bg-white/5 border-white/10 text-slate-300 cursor-not-allowed'
+                      : 'bg-white/10 border-white/20 text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:border-indigo-400'
+                  }`}
                 />
-              </div>
-
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={handleVerifyAndSaveSheet}
-                  disabled={isCheckingSheet || !inputUrl.trim()}
-                  className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-2xs transition-colors flex items-center gap-1.5 shrink-0"
-                >
-                  <CheckCircle2 className="w-4 h-4" />
-                  <span>{isCheckingSheet ? 'Memeriksa...' : 'Simpan & Hubungkan'}</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleAutoCreateSpreadsheet}
-                  disabled={isCreatingSheet || !googleToken}
-                  className="px-3.5 py-2.5 bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-2xs transition-colors flex items-center gap-1.5 shrink-0"
-                  title="Buat spreadsheet baru dengan nama DATABASE WEB IT di Google Drive Anda secara otomatis"
-                >
-                  <Sparkles className="w-4 h-4 text-amber-400" />
-                  <span>{isCreatingSheet ? 'Membuat...' : 'Buat Otomatis'}</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Syarat & Aturan Spreadsheet */}
-            <div className="p-3.5 bg-amber-50/70 border border-amber-200/80 rounded-xl text-xs space-y-1.5 text-amber-900">
-              <div className="font-bold flex items-center gap-1.5 text-amber-950">
-                <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
-                <span>Ketentuan Google Spreadsheet:</span>
-              </div>
-              <ul className="list-disc list-inside space-y-1 text-slate-700 pl-1 leading-relaxed">
-                <li>
-                  Nama spreadsheet <strong>harus persis:</strong>{' '}
-                  <span className="font-mono font-bold text-slate-900 bg-amber-100 px-1 py-0.5 rounded">
-                    DATABASE WEB IT
-                  </span>
-                </li>
-                <li>
-                  Akses link spreadsheet: pilih{' '}
-                  <span className="font-bold text-emerald-800">
-                    *Izinkan edit semua yang memiliki link (Anyone with the link can edit)
-                  </span>
-                </li>
-                <li>
-                  Struktur data terbagi menjadi 2 sheet:{' '}
-                  <strong>Sheet1 (Inventory)</strong> dan{' '}
-                  <strong>Sheet2 (Purchase Order)</strong>
-                </li>
-                <li>
-                  Data mencakup semua field: Nama barang, Foto (gambar PNG/JPG langsung di sel spreadsheet), kategori, serial number, remark/catatan, hingga{' '}
-                  <span className="font-bold text-indigo-700">ditambahkan / diedit oleh siapa</span> dan waktu update.
-                </li>
-              </ul>
-            </div>
-
-            {/* Spreadsheet Connected Card */}
-            {sheetDetails && (
-              <div className="p-4 bg-emerald-50/80 border border-emerald-200 rounded-xl space-y-3">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                  <div className="flex items-center gap-2.5">
-                    <FileSpreadsheet className="w-5 h-5 text-emerald-700 shrink-0" />
-                    <div>
-                      <div className="text-xs font-bold text-slate-900 flex items-center gap-2">
-                        <span>{sheetDetails.title}</span>
-                        {sheetDetails.isNamedCorrectly ? (
-                          <span className="px-2 py-0.2 bg-emerald-100 text-emerald-800 text-[10px] font-bold rounded-md border border-emerald-300">
-                            Nama Sesuai
-                          </span>
-                        ) : (
-                          <span className="px-2 py-0.2 bg-amber-100 text-amber-800 text-[10px] font-bold rounded-md border border-amber-300">
-                            Nama Berbeda
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-[11px] text-slate-500 font-mono truncate max-w-sm">
-                        ID: {sheetDetails.spreadsheetId}
-                      </div>
-                    </div>
+                {detectedSpreadsheetId && (
+                  <div className="absolute right-3 top-2.5 flex items-center gap-1 text-[10px] text-emerald-400 font-bold bg-emerald-500/20 px-2 py-0.5 rounded-md border border-emerald-500/30">
+                    <Check className="w-3 h-3" />
+                    <span>ID Terdeteksi</span>
                   </div>
-
+                )}
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-slate-400">
+                <span>Kolom dalam Spreadsheet: <strong>NO, ID, FOTO BARANG (DRIVE URL), NAMA, KATEGORI, TANGGAL, SN, REMARK, DITAMBAHKAN, DIUBAH, UPDATE</strong></span>
+                {detectedSpreadsheetId && (
                   <a
-                    href={sheetDetails.url}
+                    href={`https://docs.google.com/spreadsheets/d/${detectedSpreadsheetId}/edit`}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-emerald-700 hover:text-emerald-800 bg-white hover:bg-emerald-100/50 border border-emerald-300 rounded-lg transition-colors w-fit"
+                    className="inline-flex items-center gap-1 text-indigo-300 hover:text-indigo-200 underline font-semibold shrink-0"
                   >
-                    <span>Buka di Google Sheets</span>
-                    <ExternalLink className="w-3.5 h-3.5" />
+                    <span>Buka Spreadsheet</span>
+                    <ExternalLink className="w-3 h-3" />
                   </a>
-                </div>
+                )}
+              </div>
+            </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs pt-2 border-t border-emerald-200/60">
-                  <div className="flex items-center gap-2 p-2 bg-white rounded-lg border border-emerald-100">
-                    <Layers className="w-4 h-4 text-indigo-600 shrink-0" />
-                    <div>
-                      <div className="font-bold text-slate-800">Sheet 1: Inventory</div>
-                      <div className="text-[11px] text-slate-500">
-                        Item PC, Network, CCTV, SN, Remark, User
-                      </div>
-                    </div>
+            {/* Field 2: Drive Folder URL */}
+            <div className="space-y-1.5">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                <label className="text-xs font-bold text-white flex items-center gap-1.5">
+                  <FolderGit2 className="w-3.5 h-3.5 text-blue-400" />
+                  <span>URL Folder Google Drive (Penyimpanan Foto Barang)</span>
+                  {!isItManager && <Lock className="w-3 h-3 text-amber-400 inline" />}
+                </label>
+                <span className="text-[11px] text-amber-300 font-medium">
+                  *Link folder harus izinkan edit untuk semua yang memiliki link
+                </span>
+              </div>
+              <div className="relative">
+                <input
+                  type="url"
+                  value={driveFolderUrlInput}
+                  onChange={(e) => setDriveFolderUrlInput(e.target.value)}
+                  disabled={!isItManager || isSaving}
+                  placeholder="https://drive.google.com/drive/folders/1a2b3c4d5e6f7g8h9i0j_KLMNOPQRSTUV?usp=sharing"
+                  className={`w-full px-3.5 py-2.5 rounded-xl text-xs font-mono transition-colors border ${
+                    !isItManager
+                      ? 'bg-white/5 border-white/10 text-slate-300 cursor-not-allowed'
+                      : 'bg-white/10 border-white/20 text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:border-indigo-400'
+                  }`}
+                />
+                {detectedDriveFolderId && (
+                  <div className="absolute right-3 top-2.5 flex items-center gap-1 text-[10px] text-emerald-400 font-bold bg-emerald-500/20 px-2 py-0.5 rounded-md border border-emerald-500/30">
+                    <Check className="w-3 h-3" />
+                    <span>ID Terdeteksi</span>
                   </div>
-                  <div className="flex items-center gap-2 p-2 bg-white rounded-lg border border-emerald-100">
-                    <Layers className="w-4 h-4 text-sky-600 shrink-0" />
-                    <div>
-                      <div className="font-bold text-slate-800">Sheet 2: Purchase Order</div>
-                      <div className="text-[11px] text-slate-500">
-                        PO unit, status datang, remarks, User
-                      </div>
+                )}
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-slate-400">
+                <span>Foto yang diupload otomatis disimpan ke folder ini dan link dibagikan di Spreadsheet.</span>
+                {detectedDriveFolderId && (
+                  <a
+                    href={`https://drive.google.com/drive/folders/${detectedDriveFolderId}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 text-indigo-300 hover:text-indigo-200 underline font-semibold shrink-0"
+                  >
+                    <span>Buka Folder Drive</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                )}
+              </div>
+            </div>
+
+            {/* Test result message if any */}
+            {testResult && (
+              <div
+                className={`p-3.5 rounded-2xl border text-xs leading-relaxed flex items-start gap-2.5 ${
+                  testResult.success
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+                    : 'bg-rose-500/10 border-rose-500/30 text-rose-200'
+                }`}
+              >
+                {testResult.success ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                ) : (
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                )}
+                <div>
+                  <div className="font-bold">{testResult.message}</div>
+                  {testResult.success && (
+                    <div className="text-[11px] text-slate-300 mt-0.5">
+                      Spreadsheet & Folder Drive siap digunakan untuk sinkronisasi otomatis.
                     </div>
-                  </div>
+                  )}
                 </div>
               </div>
+            )}
+
+            {/* Action buttons */}
+            <div className="pt-2 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                {isItManager && (
+                  <button
+                    type="submit"
+                    disabled={isSaving}
+                    className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs rounded-xl shadow-sm transition-colors disabled:opacity-50"
+                  >
+                    {isSaving ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                    <span>Simpan Pengaturan URL</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleTestConnection}
+                  disabled={isTesting}
+                  className="flex items-center gap-2 px-3.5 py-2 bg-white/10 hover:bg-white/15 text-white font-semibold text-xs rounded-xl border border-white/10 transition-colors disabled:opacity-50"
+                >
+                  {isTesting ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                  <span>Uji Akses Koneksi</span>
+                </button>
+              </div>
+
+              {/* Sync Button */}
+              <button
+                type="button"
+                onClick={() => setShowSyncConfirmModal(true)}
+                disabled={isSyncing || (!googleSettings.spreadsheetId && !detectedSpreadsheetId)}
+                className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl shadow-sm transition-colors disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+                <span>Sinkronkan Sekarang ke Google Spreadsheet</span>
+              </button>
+            </div>
+          </form>
+
+          {/* Sync Progress Bar */}
+          {isSyncing && (
+            <div className="mt-5 p-4 rounded-2xl bg-white/10 border border-white/15 space-y-2">
+              <div className="flex items-center justify-between text-xs font-bold text-white">
+                <span className="flex items-center gap-2">
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-400" />
+                  <span>{syncProgressMsg}</span>
+                </span>
+                <span>{syncProgressPercent}%</span>
+              </div>
+              <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-emerald-400 to-teal-400 rounded-full transition-all duration-300"
+                  style={{ width: `${syncProgressPercent}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Sync History / Last Status */}
+          <div className="mt-6 pt-5 border-t border-white/10 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-slate-300">
+            <div>
+              <span className="text-slate-400">Terakhir disinkronkan: </span>
+              <strong className="text-white">
+                {googleSettings.lastSyncedAt
+                  ? new Date(googleSettings.lastSyncedAt).toLocaleString('id-ID', {
+                      day: 'numeric',
+                      month: 'short',
+                      year: 'numeric',
+                      hour: '2-digit',
+                      minute: '2-digit'
+                    })
+                  : 'Belum pernah disinkronkan'}
+              </strong>
+              {googleSettings.syncedInventoryCount !== undefined && googleSettings.syncedInventoryCount > 0 && (
+                <span className="ml-2 text-emerald-400 font-semibold">
+                  ({googleSettings.syncedInventoryCount} barang tersinkron)
+                </span>
+              )}
+            </div>
+
+            {googleSettings.lastSyncMessage && (
+              <span className="text-[11px] text-slate-400 truncate max-w-sm">
+                Status: {googleSettings.lastSyncMessage}
+              </span>
             )}
           </div>
         </div>
 
-        {/* 3. Aksi Sinkronisasi Realtime */}
-        <div className="bg-white/80 rounded-2xl p-5 border border-slate-200/80 space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div>
-              <div className="text-xs font-bold text-slate-400 uppercase tracking-wider">Langkah 3</div>
-              <div className="text-sm font-bold text-slate-900">Sinkronisasi & Pembaruan Database</div>
-              <div className="text-xs text-slate-500 mt-0.5">
-                {sheetConfig.lastSyncTime
-                  ? `Terakhir disinkronkan: ${new Date(sheetConfig.lastSyncTime).toLocaleString('id-ID')}`
-                  : 'Belum pernah disinkronkan'}
-              </div>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              <button
-                type="button"
-                onClick={handlePullFromSheets}
-                disabled={isSyncing || !sheetConfig.spreadsheetId}
-                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-2xs transition-colors flex items-center gap-1.5"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
-                <span>Tarik Data dari Spreadsheet</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={handlePushToSheets}
-                disabled={isSyncing || !sheetConfig.spreadsheetId}
-                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold text-xs rounded-xl shadow-2xs transition-colors flex items-center gap-1.5"
-              >
-                <CheckCircle2 className="w-3.5 h-3.5" />
-                <span>Kirim Semua Data ke Spreadsheet</span>
-              </button>
-            </div>
+        {/* App Info */}
+        <div className="pb-6 border-b border-slate-100 flex items-center justify-between">
+          <div>
+            <div className="text-sm font-bold text-slate-900">Application Name</div>
+            <div className="text-xs text-slate-500 mt-0.5">Hotel IT Department Inventory Management System</div>
           </div>
+          <span className="px-3 py-1 bg-indigo-50 text-indigo-700 text-xs font-bold rounded-lg border border-indigo-100">
+            v1.2.0 Cloud Connected
+          </span>
         </div>
-      </div>
-
-      {/* Other App Preferences */}
-      <div className="bg-white rounded-3xl border border-slate-200 p-6 sm:p-8 shadow-2xs space-y-6">
-        <h2 className="text-base font-bold text-slate-900 tracking-tight pb-3 border-b border-slate-100">
-          Staff & Preferences
-        </h2>
 
         {/* Current User */}
         <div className="pb-6 border-b border-slate-100 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-xl bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700 font-bold">
-              <UserIcon className="w-5 h-5" />
+              <User className="w-5 h-5" />
             </div>
             <div>
               <div className="text-sm font-bold text-slate-900">{user?.username}</div>
-              <div className="text-xs text-slate-500">{user?.role}</div>
+              <div className="text-xs text-slate-500 font-medium">Role: {user?.role}</div>
             </div>
           </div>
           <button
@@ -774,8 +787,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <HardDrive className="w-5 h-5" />
             </div>
             <div>
-              <div className="text-sm font-bold text-slate-900">Local Cache & Persistent Server DB</div>
-              <div className="text-xs text-emerald-600 font-semibold">Active & Synced to Server Database</div>
+              <div className="text-sm font-bold text-slate-900">Persistent Storage Status</div>
+              <div className="text-xs text-emerald-600 font-semibold">Active & Synced to Server Database + Google Cloud</div>
             </div>
           </div>
           <span className="text-xs text-slate-400 font-mono">data/db.json</span>
@@ -794,41 +807,53 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
       </div>
 
-      {/* Mandatory User Confirmation Modal for Destructive/Mutating Google Sheets Operations */}
-      {confirmDialog.isOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
-          <div className="bg-white rounded-3xl p-6 sm:p-7 max-w-md w-full shadow-2xl border border-slate-200 space-y-4 animate-in fade-in zoom-in-95 duration-150">
-            <div className="flex items-center gap-3">
-              <div className="w-11 h-11 rounded-2xl bg-amber-100 text-amber-700 flex items-center justify-center shrink-0">
-                <AlertCircle className="w-6 h-6" />
+      {/* Confirmation Modal for Google Sync (Workspace Safety Guideline) */}
+      {showSyncConfirmModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs animate-in fade-in duration-150">
+          <div className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl border border-slate-100 space-y-4">
+            <div className="flex items-center gap-3 text-emerald-600">
+              <div className="w-10 h-10 rounded-xl bg-emerald-50 border border-emerald-100 flex items-center justify-center">
+                <FileSpreadsheet className="w-5 h-5" />
               </div>
               <div>
-                <h3 className="text-base font-black text-slate-900">{confirmDialog.title}</h3>
-                <p className="text-xs text-slate-500">Konfirmasi Operasi Google Sheets</p>
+                <h3 className="text-base font-black text-slate-900">Konfirmasi Sinkronisasi Google</h3>
+                <p className="text-xs text-slate-500">Google Spreadsheet & Drive Database</p>
               </div>
             </div>
 
             <p className="text-xs sm:text-sm text-slate-600 leading-relaxed">
-              {confirmDialog.message}
+              Apakah Anda yakin ingin menyinkronkan seluruh database inventaris ke Google Spreadsheet?
             </p>
 
-            <div className="flex items-center justify-end gap-2.5 pt-3 border-t border-slate-100">
+            <ul className="text-xs text-slate-600 space-y-1.5 bg-slate-50 p-3.5 rounded-xl border border-slate-200">
+              <li className="flex items-center gap-2">
+                <Check className="w-3.5 h-3.5 text-emerald-600" />
+                <span>Foto barang akan diupload ke Folder Google Drive.</span>
+              </li>
+              <li className="flex items-center gap-2">
+                <Check className="w-3.5 h-3.5 text-emerald-600" />
+                <span>Tab <strong>INVENTORY DATABASE</strong> pada Google Spreadsheet akan diperbarui dengan link foto Drive yang rapi.</span>
+              </li>
+              <li className="flex items-center gap-2">
+                <Check className="w-3.5 h-3.5 text-emerald-600" />
+                <span>Data di server lokal akan tetap tersimpan aman.</span>
+              </li>
+            </ul>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2">
               <button
                 type="button"
-                onClick={() => setConfirmDialog(prev => ({ ...prev, isOpen: false }))}
-                className="px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 rounded-xl transition-colors"
+                onClick={() => setShowSyncConfirmModal(false)}
+                className="px-4 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors"
               >
                 Batal
               </button>
               <button
                 type="button"
-                onClick={async () => {
-                  setConfirmDialog(prev => ({ ...prev, isOpen: false }));
-                  await confirmDialog.onConfirm();
-                }}
-                className="px-4 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl shadow-2xs transition-colors"
+                onClick={handleExecuteSync}
+                className="px-4 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-500 rounded-xl transition-colors shadow-sm"
               >
-                {confirmDialog.actionLabel}
+                Ya, Mulai Sinkronisasi
               </button>
             </div>
           </div>

@@ -8,6 +8,7 @@ import ExcelJS from 'exceljs';
 import type { InventoryItem, PurchaseOrderItem, UserAccount, ActivityRecord, Category } from './src/lib/types';
 import { isDateRepairedInMonth, parseMonthFilter, filterInventory, sortInventory, computeStats, MONTH_NAMES, formatDate, formatDateTime } from './src/lib/inventory-logic';
 import { filterPurchaseOrders, sortPurchaseOrders, computePOStats } from './src/lib/po-logic';
+import { extractGoogleSpreadsheetId, extractGoogleDriveFolderId } from './src/lib/google-logic';
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -27,12 +28,23 @@ if (!fs.existsSync(UPLOADS_DIR)) {
 const activeSessions = new Map<string, { user: UserAccount; expiresAt: number }>();
 const secretTokens = new Set<string>();
 
-export interface SheetConfig {
-  spreadsheetUrl?: string;
-  spreadsheetId?: string;
-  spreadsheetTitle?: string;
-  isEnabled: boolean;
-  lastSyncTime?: string | null;
+export interface GoogleIntegrationData {
+  spreadsheetUrl: string;
+  spreadsheetId: string;
+  driveFolderUrl: string;
+  driveFolderId: string;
+  connectedAccount: {
+    email: string;
+    name: string;
+    photoUrl?: string;
+    connectedAt: string;
+    connectedBy: string;
+  } | null;
+  cachedAccessToken?: string | null;
+  lastSyncedAt?: string | null;
+  lastSyncStatus?: 'idle' | 'success' | 'failed' | 'in_progress' | null;
+  lastSyncMessage?: string | null;
+  syncedInventoryCount?: number;
 }
 
 interface DBData {
@@ -40,7 +52,7 @@ interface DBData {
   inventory: InventoryItem[];
   purchaseOrders: PurchaseOrderItem[];
   activities: ActivityRecord[];
-  sheetConfig?: SheetConfig;
+  googleIntegration?: GoogleIntegrationData;
 }
 
 // Helper to create sample SVG placeholder images
@@ -65,6 +77,20 @@ function initDB(): DBData {
       if (parsed.users && parsed.inventory) {
         if (!parsed.purchaseOrders) {
           parsed.purchaseOrders = [];
+        }
+        if (!parsed.googleIntegration) {
+          parsed.googleIntegration = {
+            spreadsheetUrl: '',
+            spreadsheetId: '',
+            driveFolderUrl: '',
+            driveFolderId: '',
+            connectedAccount: null,
+            cachedAccessToken: null,
+            lastSyncedAt: null,
+            lastSyncStatus: 'idle',
+            lastSyncMessage: null,
+            syncedInventoryCount: 0
+          };
         }
         return parsed;
       }
@@ -279,7 +305,19 @@ function initDB(): DBData {
     users: initialUsers,
     inventory: sampleInventory,
     purchaseOrders: samplePurchaseOrders,
-    activities: initialActivities
+    activities: initialActivities,
+    googleIntegration: {
+      spreadsheetUrl: '',
+      spreadsheetId: '',
+      driveFolderUrl: '',
+      driveFolderId: '',
+      connectedAccount: null,
+      cachedAccessToken: null,
+      lastSyncedAt: null,
+      lastSyncStatus: 'idle',
+      lastSyncMessage: null,
+      syncedInventoryCount: 0
+    }
   };
 
   const tempPath = `${DB_FILE}.tmp`;
@@ -353,6 +391,22 @@ if (!dbCache.purchaseOrders || dbCache.purchaseOrders.length === 0) {
       updatedBy: 'ITTRAINEE'
     }
   ];
+  saveDB(dbCache);
+}
+
+if (!dbCache.googleIntegration) {
+  dbCache.googleIntegration = {
+    spreadsheetUrl: '',
+    spreadsheetId: '',
+    driveFolderUrl: '',
+    driveFolderId: '',
+    connectedAccount: null,
+    cachedAccessToken: null,
+    lastSyncedAt: null,
+    lastSyncStatus: 'idle',
+    lastSyncMessage: null,
+    syncedInventoryCount: 0
+  };
   saveDB(dbCache);
 }
 
@@ -1517,85 +1571,156 @@ app.get('/api/export/excel', requireAuth, async (req: Request, res: Response) =>
   }
 });
 
-// 24. Get Google Sheets Integration Configuration
-app.get('/api/settings/sheets', requireAuth, (req: Request, res: Response) => {
-  res.json({
-    config: dbCache.sheetConfig || {
-      isEnabled: false,
-      spreadsheetUrl: '',
-      spreadsheetId: '',
-      spreadsheetTitle: '',
-      lastSyncTime: null
-    }
-  });
+// ==========================================
+// GOOGLE SPREADSHEET & DRIVE INTEGRATION ROUTES
+// ==========================================
+
+// 25. Get Google Integration Settings (Available for all authenticated users to read)
+app.get('/api/settings/google', requireAuth, (req: Request, res: Response) => {
+  res.json({ data: dbCache.googleIntegration });
 });
 
-// 25. Update Google Sheets Integration Configuration
-app.post('/api/settings/sheets', requireAuth, (req: Request, res: Response) => {
-  const { spreadsheetUrl, spreadsheetId, spreadsheetTitle, isEnabled } = req.body;
+// 26. Save Google Integration Settings (ONLY IT MANAGER)
+app.post('/api/settings/google', requireAuth, (req: Request, res: Response) => {
+  const user = (req as any).user as UserAccount;
+  if (user.role !== 'IT MANAGER') {
+    res.status(403).json({
+      error: 'Akses Ditolak: Hanya IT MANAGER yang berhak mengisi dan menyimpan URL Google Spreadsheet dan Google Drive.'
+    });
+    return;
+  }
 
-  dbCache.sheetConfig = {
-    spreadsheetUrl: spreadsheetUrl || '',
-    spreadsheetId: spreadsheetId || '',
-    spreadsheetTitle: spreadsheetTitle || '',
-    isEnabled: Boolean(isEnabled),
-    lastSyncTime: dbCache.sheetConfig?.lastSyncTime || null
+  const { spreadsheetUrl = '', driveFolderUrl = '' } = req.body;
+  const spreadsheetId = extractGoogleSpreadsheetId(spreadsheetUrl) || '';
+  const driveFolderId = extractGoogleDriveFolderId(driveFolderUrl) || '';
+
+  dbCache.googleIntegration = {
+    ...dbCache.googleIntegration!,
+    spreadsheetUrl: (spreadsheetUrl || '').trim(),
+    spreadsheetId,
+    driveFolderUrl: (driveFolderUrl || '').trim(),
+    driveFolderId
   };
 
   saveDB(dbCache);
 
   res.json({
-    message: 'Google Sheets configuration saved.',
-    config: dbCache.sheetConfig
+    message: 'Pengaturan Google Spreadsheet & Drive berhasil disimpan oleh IT MANAGER.',
+    data: dbCache.googleIntegration
   });
 });
 
-// 26. Get All Data (for syncing to Google Sheets)
-app.get('/api/database/all-data', requireAuth, (req: Request, res: Response) => {
-  res.json({
-    inventory: dbCache.inventory || [],
-    purchaseOrders: dbCache.purchaseOrders || [],
-    sheetConfig: dbCache.sheetConfig
-  });
-});
-
-// 27. Sync Data from Google Sheets into Server
-app.post('/api/database/sync-from-sheets', requireAuth, (req: Request, res: Response) => {
-  const { inventory, purchaseOrders } = req.body;
+// 27. Connect Google Account (ONLY IT MANAGER)
+app.post('/api/settings/google/connect', requireAuth, (req: Request, res: Response) => {
   const user = (req as any).user as UserAccount;
-
-  if (Array.isArray(inventory)) {
-    dbCache.inventory = inventory;
+  if (user.role !== 'IT MANAGER') {
+    res.status(403).json({
+      error: 'Akses Ditolak: Hanya IT MANAGER yang berhak menghubungkan akun Google.'
+    });
+    return;
   }
-  if (Array.isArray(purchaseOrders)) {
-    dbCache.purchaseOrders = purchaseOrders;
+
+  const { account, accessToken } = req.body;
+  if (!account || !account.email) {
+    res.status(400).json({ error: 'Informasi akun Google tidak valid.' });
+    return;
   }
 
-  const nowIso = new Date().toISOString();
-  if (!dbCache.sheetConfig) {
-    dbCache.sheetConfig = { isEnabled: true };
-  }
-  dbCache.sheetConfig.lastSyncTime = nowIso;
+  dbCache.googleIntegration = {
+    ...dbCache.googleIntegration!,
+    connectedAccount: {
+      email: account.email,
+      name: account.name || account.email,
+      photoUrl: account.photoUrl || '',
+      connectedAt: new Date().toISOString(),
+      connectedBy: user.username
+    },
+    cachedAccessToken: accessToken || dbCache.googleIntegration?.cachedAccessToken || null
+  };
 
-  // Add activity log
-  const syncActivity: ActivityRecord = {
+  dbCache.activities.unshift({
     id: `act-${Date.now()}`,
-    itemName: 'DATABASE WEB IT (Google Sheets)',
+    itemName: `Google Drive & Sheets (${account.email})`,
     category: 'PC ITEMS',
     action: 'Edited',
     username: user.username,
-    timestamp: nowIso
-  };
-  dbCache.activities.unshift(syncActivity);
+    timestamp: new Date().toISOString()
+  });
 
   saveDB(dbCache);
 
   res.json({
-    message: 'Database successfully synced with Google Sheets.',
-    inventoryCount: dbCache.inventory.length,
-    poCount: dbCache.purchaseOrders.length,
-    lastSyncTime: nowIso
+    message: 'Akun Google berhasil dihubungkan oleh IT MANAGER.',
+    data: dbCache.googleIntegration
   });
+});
+
+// 28. Disconnect Google Account (ONLY IT MANAGER)
+app.post('/api/settings/google/disconnect', requireAuth, (req: Request, res: Response) => {
+  const user = (req as any).user as UserAccount;
+  if (user.role !== 'IT MANAGER') {
+    res.status(403).json({
+      error: 'Akses Ditolak: Hanya IT MANAGER yang berhak memutuskan koneksi akun Google.'
+    });
+    return;
+  }
+
+  dbCache.googleIntegration = {
+    ...dbCache.googleIntegration!,
+    connectedAccount: null,
+    cachedAccessToken: null
+  };
+
+  dbCache.activities.unshift({
+    id: `act-${Date.now()}`,
+    itemName: 'Google Drive & Sheets Disconnected',
+    category: 'PC ITEMS',
+    action: 'Edited',
+    username: user.username,
+    timestamp: new Date().toISOString()
+  });
+
+  saveDB(dbCache);
+
+  res.json({
+    message: 'Koneksi akun Google telah berhasil diputuskan.',
+    data: dbCache.googleIntegration
+  });
+});
+
+// 29. Update Sync Status
+app.post('/api/settings/google/sync-status', requireAuth, (req: Request, res: Response) => {
+  const { status, message, syncedCount } = req.body;
+
+  dbCache.googleIntegration = {
+    ...dbCache.googleIntegration!,
+    lastSyncedAt: new Date().toISOString(),
+    lastSyncStatus: status,
+    lastSyncMessage: message,
+    syncedInventoryCount: typeof syncedCount === 'number' ? syncedCount : dbCache.inventory.length
+  };
+
+  saveDB(dbCache);
+  res.json({ success: true, data: dbCache.googleIntegration });
+});
+
+// 30. Sync items with Google Drive photo URLs back to DB
+app.post('/api/settings/google/sync-items', requireAuth, (req: Request, res: Response) => {
+  const { items } = req.body;
+  if (Array.isArray(items)) {
+    let updatedCount = 0;
+    for (const updatedItem of items) {
+      const idx = dbCache.inventory.findIndex(i => i.id === updatedItem.id);
+      if (idx !== -1 && updatedItem.photoUrl && updatedItem.photoUrl !== dbCache.inventory[idx].photoUrl) {
+        dbCache.inventory[idx].photoUrl = updatedItem.photoUrl;
+        updatedCount++;
+      }
+    }
+    if (updatedCount > 0) {
+      saveDB(dbCache);
+    }
+  }
+  res.json({ success: true, total: dbCache.inventory.length });
 });
 
 // Setup Vite development or production static server

@@ -6,7 +6,9 @@ import type {
   FilterOptions,
   PurchaseOrderItem,
   POFilterOptions,
-  POStats
+  POStats,
+  GoogleIntegrationSettings,
+  GoogleAccountInfo
 } from './types';
 
 const TOKEN_KEY = 'hotel_it_token';
@@ -318,42 +320,56 @@ export async function downloadPOExcel(filters: POFilterOptions = {}): Promise<vo
   window.URL.revokeObjectURL(downloadUrl);
 }
 
-// Google Sheets Sync Config & Endpoints
-export interface SheetConfig {
-  spreadsheetUrl?: string;
-  spreadsheetId?: string;
-  spreadsheetTitle?: string;
-  isEnabled: boolean;
-  lastSyncTime?: string | null;
+// ==========================================
+// Google Spreadsheet & Drive Integration API
+// ==========================================
+
+export async function fetchGoogleSettings(): Promise<GoogleIntegrationSettings> {
+  const res = await request<{ data: GoogleIntegrationSettings }>('/api/settings/google');
+  return res.data;
 }
 
-export async function fetchSheetConfig(): Promise<SheetConfig> {
-  const res = await request<{ config: SheetConfig }>('/api/settings/sheets');
-  return res.config;
-}
-
-export async function saveSheetConfig(config: Partial<SheetConfig>): Promise<SheetConfig> {
-  const res = await request<{ message: string; config: SheetConfig }>('/api/settings/sheets', {
+export async function saveGoogleSettings(payload: {
+  spreadsheetUrl: string;
+  driveFolderUrl: string;
+}): Promise<{ message: string; data: GoogleIntegrationSettings }> {
+  return request<{ message: string; data: GoogleIntegrationSettings }>('/api/settings/google', {
     method: 'POST',
-    body: JSON.stringify(config)
+    body: JSON.stringify(payload)
   });
-  return res.config;
 }
 
-export async function fetchAllData(): Promise<{ inventory: InventoryItem[]; purchaseOrders: PurchaseOrderItem[]; sheetConfig?: SheetConfig }> {
-  return request<{ inventory: InventoryItem[]; purchaseOrders: PurchaseOrderItem[]; sheetConfig?: SheetConfig }>('/api/database/all-data');
+export async function saveGoogleAccountConnection(payload: {
+  account: GoogleAccountInfo;
+  accessToken: string;
+}): Promise<{ message: string; data: GoogleIntegrationSettings }> {
+  return request<{ message: string; data: GoogleIntegrationSettings }>('/api/settings/google/connect', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  });
 }
 
-export async function syncDataFromSheets(
-  inventory: InventoryItem[],
-  purchaseOrders: PurchaseOrderItem[]
-): Promise<{ message: string; inventoryCount: number; poCount: number; lastSyncTime: string }> {
-  return request<{ message: string; inventoryCount: number; poCount: number; lastSyncTime: string }>(
-    '/api/database/sync-from-sheets',
-    {
-      method: 'POST',
-      body: JSON.stringify({ inventory, purchaseOrders })
-    }
-  );
+export async function disconnectGoogleAccountApi(): Promise<{ message: string; data: GoogleIntegrationSettings }> {
+  return request<{ message: string; data: GoogleIntegrationSettings }>('/api/settings/google/disconnect', {
+    method: 'POST'
+  });
+}
+
+export async function recordGoogleSyncStatus(payload: {
+  status: 'success' | 'failed' | 'in_progress';
+  message: string;
+  syncedCount?: number;
+}): Promise<{ success: boolean }> {
+  return request<{ success: boolean }>('/api/settings/google/sync-status', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function syncUpdatedInventoryItemsToServer(items: InventoryItem[]): Promise<void> {
+  await request('/api/settings/google/sync-items', {
+    method: 'POST',
+    body: JSON.stringify({ items })
+  });
 }
 
